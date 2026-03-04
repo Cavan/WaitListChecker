@@ -124,6 +124,319 @@ Each module should have **one job** and expose a small, clear interface:
 
 > **Learning tip:** Ask yourself "can I test this function without the internet or a real email server?" If the answer is no, you probably need to split it further.
 
+### Code Snippets — Starter Examples
+
+These are **partial examples** to show the pattern. You'll need to fill in error handling, edge cases, and details yourself.
+
+#### `src/config.py` — Loading settings
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env file into os.environ
+
+# Challenge: try converting this to a dataclass instead.
+# What benefits does that give you over a plain dict?
+config = {
+    "target_url": os.environ["TARGET_URL"],
+    "css_selector": os.environ["CSS_SELECTOR"],
+    "smtp_host": os.environ["SMTP_HOST"],
+    "smtp_port": int(os.environ["SMTP_PORT"]),
+    "email_user": os.environ["EMAIL_USER"],
+    "email_pass": os.environ["EMAIL_PASS"],
+    "subscriber_email": os.environ["SUBSCRIBER_EMAIL"],
+}
+```
+
+#### `src/scraper.py` — Separating I/O from parsing
+
+```python
+import requests
+from bs4 import BeautifulSoup
+
+
+def fetch_page(url: str, timeout: int = 10) -> str:
+    """Fetch raw HTML from a URL. This is the I/O boundary."""
+    # TODO: Add a User-Agent header. Why does this matter?
+    # TODO: What happens if the request times out? Handle it.
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()  # raises an exception for 4xx/5xx
+    return response.text
+
+
+def parse_value(html: str, css_selector: str) -> str | None:
+    """Extract text from the first element matching the CSS selector.
+
+    This is a PURE function — no network calls, no side effects.
+    That makes it very easy to test.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    element = soup.select_one(css_selector)
+    # TODO: What should you return if element is None?
+    # TODO: Should you strip whitespace from the text?
+    return element.get_text(strip=True) if element else None
+```
+
+#### `src/checker.py` — Pure logic, no dependencies
+
+```python
+def has_value_changed(new_value: str | None, old_value: str | None) -> bool:
+    """Determine if the scraped value has changed.
+
+    This function has ZERO imports and ZERO I/O.
+    It's the easiest module to unit test — start here with TDD.
+    """
+    # TODO: Handle these edge cases:
+    # - First run ever (old_value is None)
+    # - Value disappeared (new_value is None but old_value exists)
+    # - Values are the same
+    # - Values are different
+    pass  # your logic here
+```
+
+#### `src/storage.py` — Database wrapper
+
+```python
+import sqlite3
+from datetime import datetime
+
+DB_PATH = "results.db"
+
+
+def _get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+    """Create a DB connection. Using a parameter makes testing easy —
+    pass \":memory:\" in tests for an in-memory database."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row  # access columns by name
+    return conn
+
+
+def init_db(db_path: str = DB_PATH) -> None:
+    """Create the results table if it doesn't exist."""
+    with _get_connection(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT,
+                checked_at TEXT NOT NULL
+            )
+        """)
+
+
+def save_result(value: str, checked_at: datetime, db_path: str = DB_PATH) -> None:
+    # TODO: Insert a row. Use parameterized queries (?) to avoid SQL injection.
+    # Research: why is "with conn" important here?
+    pass
+
+
+def get_latest_result(db_path: str = DB_PATH) -> dict | None:
+    # TODO: SELECT the most recent row by checked_at.
+    # Return it as a dict, or None if the table is empty.
+    pass
+```
+
+#### `src/notifier.py` — Email sending
+
+```python
+import smtplib
+from email.mime.text import MIMEText
+
+
+def send_email(subject: str, body: str, recipient: str, config: dict) -> None:
+    """Send a plain-text email via SMTP."""
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = config["email_user"]
+    msg["To"] = recipient
+
+    # TODO: Connect to the SMTP server and send the message.
+    # Research: what's the difference between SMTP_SSL and SMTP + starttls()?
+    # TODO: Wrap this in a try/except and log errors instead of crashing.
+    pass
+```
+
+#### `main.py` — The orchestrator
+
+```python
+import logging
+from src.config import config
+from src.scraper import fetch_page, parse_value
+from src.checker import has_value_changed
+from src.storage import init_db, save_result, get_latest_result
+from src.notifier import send_email
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def main() -> None:
+    """Orchestrate the scrape-check-notify pipeline.
+
+    Notice: this function contains NO business logic.
+    It only calls other modules in sequence.
+    """
+    init_db()
+
+    # 1. Scrape
+    html = fetch_page(config["target_url"])
+    new_value = parse_value(html, config["css_selector"])
+    logger.info(f"Scraped value: {new_value}")
+
+    # 2. Compare with previous
+    previous = get_latest_result()
+    old_value = previous["value"] if previous else None
+
+    # 3. Store
+    save_result(new_value, datetime.now())
+
+    # 4. Notify if changed
+    if has_value_changed(new_value, old_value):
+        logger.info("Value changed! Sending notification...")
+        send_email(
+            subject="WaitListChecker: Value Changed!",
+            body=f"Old: {old_value}\nNew: {new_value}",
+            recipient=config["subscriber_email"],
+            config=config,
+        )
+    else:
+        logger.info("No change detected.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### Example test — `tests/test_checker.py` (TDD starting point)
+
+```python
+from src.checker import has_value_changed
+
+
+def test_different_values_returns_true():
+    assert has_value_changed("new", "old") is True
+
+
+def test_same_values_returns_false():
+    assert has_value_changed("same", "same") is False
+
+
+def test_first_run_no_old_value():
+    # First time running — there's no previous value
+    assert has_value_changed("something", None) is True
+
+
+def test_value_disappeared():
+    # The element is gone from the page
+    assert has_value_changed(None, "was_here") is True
+
+
+def test_both_none():
+    # No value before, no value now — nothing changed
+    assert has_value_changed(None, None) is False
+```
+
+#### Example test — `tests/test_scraper.py` (mocking HTTP)
+
+```python
+import responses
+from src.scraper import fetch_page, parse_value
+
+SAMPLE_HTML = """
+<html>
+  <body>
+    <div class="waitlist">
+      <span class="position">42</span>
+    </div>
+  </body>
+</html>
+"""
+
+
+def test_parse_value_extracts_text():
+    # No HTTP needed — parse_value is a pure function
+    result = parse_value(SAMPLE_HTML, ".waitlist .position")
+    assert result == "42"
+
+
+def test_parse_value_returns_none_for_missing_selector():
+    result = parse_value(SAMPLE_HTML, ".nonexistent")
+    assert result is None
+
+
+@responses.activate
+def test_fetch_page_returns_html():
+    # Mock the HTTP call so no real request is made
+    responses.add(responses.GET, "https://example.com", body=SAMPLE_HTML, status=200)
+    result = fetch_page("https://example.com")
+    assert "waitlist" in result
+
+
+# TODO: Add tests for HTTP errors (404, 500, timeout)
+```
+
+---
+
+## Creating requirements.txt
+
+There are two approaches:
+
+### Option A: Write it manually (recommended for learning)
+
+Create `requirements.txt` in the project root:
+
+```
+requests
+beautifulsoup4
+lxml
+python-dotenv
+schedule
+```
+
+Create `requirements-dev.txt` (includes the main deps plus testing tools):
+
+```
+-r requirements.txt
+pytest
+responses
+pytest-cov
+```
+
+> The `-r requirements.txt` line tells pip to install everything from that file first, then the additional dev packages.
+
+### Option B: Pin exact versions (best practice for reproducibility)
+
+After installing packages, freeze the exact versions:
+
+```bash
+pip freeze > requirements.txt
+```
+
+This produces output like:
+
+```
+beautifulsoup4==4.12.3
+certifi==2024.8.30
+charset-normalizer==3.4.0
+...
+```
+
+> **Trade-off:** Pinned versions guarantee reproducibility but need periodic updates. Unpinned versions always get the latest but could break unexpectedly. For a learning project, Option A is fine. For production, use Option B.
+
+### Install after creating
+
+```bash
+# Make sure your venv is active first!
+source .venv/bin/activate
+
+# Install runtime dependencies
+pip install -r requirements.txt
+
+# Install dev dependencies (includes runtime deps via -r flag)
+pip install -r requirements-dev.txt
+```
+
 ---
 
 ## Implementation Steps
@@ -132,9 +445,18 @@ Each module should have **one job** and expose a small, clear interface:
 
 - Create the folder structure above.
 - Initialize a virtual environment (see [Python Environment Setup](#python-environment-setup)).
-- Create `requirements.txt` with: `requests`, `beautifulsoup4`, `lxml`, `python-dotenv`, `schedule`.
-- Create `requirements-dev.txt` with: `pytest`, `responses` (or `requests-mock`), `pytest-cov`.
-- Create `.env.example` with placeholder keys: `TARGET_URL`, `CSS_SELECTOR`, `SMTP_HOST`, `SMTP_PORT`, `EMAIL_USER`, `EMAIL_PASS`, `SUBSCRIBER_EMAIL`.
+- Create `requirements.txt` and `requirements-dev.txt` (see [Creating requirements.txt](#creating-requirementstxt)).
+- Create `.env.example` with placeholder keys:
+
+```ini
+TARGET_URL=https://example.com/waitlist
+CSS_SELECTOR=.waitlist .position
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+EMAIL_USER=your-email@gmail.com
+EMAIL_PASS=your-app-password
+SUBSCRIBER_EMAIL=subscriber@example.com
+```
 
 ### Step 2: Implement `config.py`
 
