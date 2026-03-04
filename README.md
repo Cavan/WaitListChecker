@@ -376,6 +376,244 @@ def test_fetch_page_returns_html():
 # TODO: Add tests for HTTP errors (404, 500, timeout)
 ```
 
+#### Example test — `tests/test_storage.py` (in-memory database)
+
+```python
+import pytest
+from datetime import datetime
+from src.storage import init_db, save_result, get_latest_result
+
+
+@pytest.fixture
+def db():
+    """Create a fresh in-memory database for each test.
+
+    Fixtures are pytest's way of sharing setup code across tests.
+    ':memory:' creates a SQLite DB that lives only in RAM — it's
+    fast and disappears after each test, so tests never interfere
+    with each other.
+    """
+    db_path = ":memory:"
+    init_db(db_path)
+    return db_path
+
+
+def test_get_latest_result_returns_none_when_empty(db):
+    # Brand new database — nothing stored yet
+    result = get_latest_result(db)
+    assert result is None
+
+
+def test_save_and_retrieve_result(db):
+    # Save a value, then read it back
+    now = datetime.now()
+    save_result("42", now, db)
+
+    result = get_latest_result(db)
+    assert result is not None
+    assert result["value"] == "42"
+
+
+def test_get_latest_returns_most_recent(db):
+    # Save two results — should get the newest one back
+    save_result("old", datetime(2026, 1, 1), db)
+    save_result("new", datetime(2026, 3, 3), db)
+
+    result = get_latest_result(db)
+    assert result["value"] == "new"
+
+
+# TODO: What happens if you save None as the value?
+# TODO: What happens with duplicate timestamps?
+```
+
+#### Example test — `tests/test_notifier.py` (mocking email)
+
+```python
+from unittest.mock import patch, MagicMock
+from src.notifier import send_email
+
+FAKE_CONFIG = {
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "email_user": "test@example.com",
+    "email_pass": "fake-password",
+}
+
+
+@patch("src.notifier.smtplib.SMTP_SSL")
+def test_send_email_calls_smtp(mock_smtp_class):
+    """Mock the SMTP connection so no real email is sent.
+
+    unittest.mock.patch replaces smtplib.SMTP_SSL with a fake object
+    for the duration of this test. We can then check that our code
+    called the right methods with the right arguments.
+    """
+    # Create a mock SMTP instance that the context manager will return
+    mock_server = MagicMock()
+    mock_smtp_class.return_value.__enter__ = MagicMock(return_value=mock_server)
+    mock_smtp_class.return_value.__exit__ = MagicMock(return_value=False)
+
+    send_email(
+        subject="Test Subject",
+        body="Test body",
+        recipient="subscriber@example.com",
+        config=FAKE_CONFIG,
+    )
+
+    # Verify SMTP was connected to the right server
+    mock_smtp_class.assert_called_once_with(
+        FAKE_CONFIG["smtp_host"], FAKE_CONFIG["smtp_port"]
+    )
+    # Verify login was called
+    mock_server.login.assert_called_once_with(
+        FAKE_CONFIG["email_user"], FAKE_CONFIG["email_pass"]
+    )
+    # Verify an email was actually sent
+    mock_server.send_message.assert_called_once()
+
+
+# TODO: Test what happens when SMTP raises an exception
+# TODO: Test that the email subject and body are correct
+```
+
+#### Example — `tests/conftest.py` (shared fixtures)
+
+```python
+import pytest
+
+SAMPLE_HTML = """
+<html>
+  <body>
+    <div class="waitlist">
+      <span class="position">42</span>
+    </div>
+  </body>
+</html>
+"""
+
+SAMPLE_HTML_NO_VALUE = """
+<html>
+  <body>
+    <div class="waitlist">
+      <span class="position"></span>
+    </div>
+  </body>
+</html>
+"""
+
+FAKE_CONFIG = {
+    "target_url": "https://example.com/waitlist",
+    "css_selector": ".waitlist .position",
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "email_user": "test@example.com",
+    "email_pass": "fake-password",
+    "subscriber_email": "subscriber@example.com",
+}
+
+
+@pytest.fixture
+def sample_html():
+    """Provide sample HTML to any test that needs it."""
+    return SAMPLE_HTML
+
+
+@pytest.fixture
+def fake_config():
+    """Provide a fake config dict — no real secrets needed."""
+    return FAKE_CONFIG.copy()  # .copy() so tests can't pollute each other
+```
+
+> **Key testing concepts shown above:**
+> - **Fixtures** (`@pytest.fixture`) — reusable setup code injected into tests by name
+> - **In-memory DB** — pass `":memory:"` instead of a file path so tests are fast and isolated
+> - **Mocking** (`unittest.mock.patch`) — replace real objects (SMTP, HTTP) with fakes so you can test without side effects
+> - **Assertions on mocks** — verify your code called the right methods with the right arguments
+> - **Test isolation** — each test gets its own fresh state; no test depends on another
+
+---
+
+## Understanding .env Configuration
+
+### What is `.env`?
+
+A `.env` file stores **environment variables** — configuration values that change between environments (your laptop vs. GitHub Actions vs. production). It keeps secrets like passwords **out of your source code**.
+
+### How it works
+
+1. You create a `.env` file in your project root (never committed to git)
+2. `python-dotenv` reads it and loads the values into `os.environ`
+3. Your `config.py` reads from `os.environ`
+
+```
+.env              →  python-dotenv loads it  →  os.environ["KEY"]  →  config.py reads it
+(file on disk)       (at program startup)       (in memory)            (your code uses it)
+```
+
+### The `.env` file
+
+Create this in your project root (copy from `.env.example` and fill in real values):
+
+```ini
+# The webpage to scrape
+TARGET_URL=https://example.com/waitlist
+
+# CSS selector to find the value on the page
+# Use browser DevTools (F12 → Elements → right-click → Copy selector) to find this
+CSS_SELECTOR=.waitlist .position
+
+# SMTP email settings (example uses Gmail)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+EMAIL_USER=your-email@gmail.com
+EMAIL_PASS=abcd efgh ijkl mnop
+
+# Who receives the notification
+SUBSCRIBER_EMAIL=friend@example.com
+```
+
+### Each variable explained
+
+| Variable | What it does | How to get it |
+|---|---|---|
+| `TARGET_URL` | The full URL of the page you want to scrape | Copy from your browser's address bar |
+| `CSS_SELECTOR` | Tells BeautifulSoup which HTML element to extract | Use browser DevTools: right-click element → Inspect → right-click in Elements panel → Copy → Copy selector |
+| `SMTP_HOST` | The mail server address | Depends on your provider (see [Email Provider Options](#email-provider-options)) |
+| `SMTP_PORT` | The mail server port | Usually `465` (SSL) or `587` (STARTTLS) |
+| `EMAIL_USER` | Your email address (the "from" address) | Your email login |
+| `EMAIL_PASS` | Your email password or app-specific password | **Gmail:** Google Account → Security → 2FA → App Passwords → generate one. **Never use your real password.** |
+| `SUBSCRIBER_EMAIL` | Who gets notified when the value changes | Any valid email address |
+
+### `.env` vs `.env.example`
+
+| File | Committed to git? | Contains real secrets? | Purpose |
+|---|---|---|---|
+| `.env` | **No** (in `.gitignore`) | **Yes** | Your actual config, only on your machine |
+| `.env.example` | **Yes** | **No** (placeholders only) | Documents what variables are needed for new contributors |
+
+### Using secrets in GitHub Actions
+
+When running on GitHub Actions, there's no `.env` file. Instead:
+
+1. Go to your repo → **Settings** → **Secrets and variables** → **Actions**
+2. Add each variable as a **repository secret** (e.g., `EMAIL_USER`, `EMAIL_PASS`)
+3. Reference them in your workflow file:
+
+```yaml
+# .github/workflows/check.yml
+env:
+  TARGET_URL: ${{ secrets.TARGET_URL }}
+  CSS_SELECTOR: ${{ secrets.CSS_SELECTOR }}
+  SMTP_HOST: ${{ secrets.SMTP_HOST }}
+  SMTP_PORT: ${{ secrets.SMTP_PORT }}
+  EMAIL_USER: ${{ secrets.EMAIL_USER }}
+  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+  SUBSCRIBER_EMAIL: ${{ secrets.SUBSCRIBER_EMAIL }}
+```
+
+`python-dotenv` is smart enough to skip loading `.env` if the variables are already set in the environment, so the same `config.py` code works both locally and on GitHub Actions.
+
 ---
 
 ## Creating requirements.txt
@@ -553,6 +791,129 @@ Goal: Aim for 80%+ coverage on `src/`, but focus on *meaningful* tests over chas
 6. Deploy to GitHub Actions
 
 Each step gives you a working, testable piece before moving on. Resist the urge to build it all at once.
+
+---
+
+## Email Provider Options
+
+### Free SMTP Providers (direct replacement for Gmail)
+
+| Provider | Free Tier | SMTP Settings | Notes |
+|---|---|---|---|
+| **Gmail** | Unlimited personal use | `smtp.gmail.com:465` (SSL) | Requires an App Password |
+| **Outlook/Hotmail** | Unlimited personal use | `smtp-mail.outlook.com:587` (STARTTLS) | Works the same way as Gmail in `notifier.py` |
+| **Yahoo Mail** | Unlimited personal use | `smtp.mail.yahoo.com:465` (SSL) | Also requires an App Password |
+| **Zoho Mail** | 5 users, 5GB | `smtp.zoho.com:465` (SSL) | Free plan restricts to Zoho-to-Zoho unless you verify a domain |
+
+These all use `smtplib` the same way — just swap the host/port in your config.
+
+### Transactional Email APIs (built for automated sending)
+
+| Provider | Free Tier | Approach | Best For |
+|---|---|---|---|
+| **Mailgun** | 100 emails/day (sandbox) | REST API or SMTP relay | Most popular for devs; great docs |
+| **SendGrid** | 100 emails/day | REST API or SMTP relay | Owned by Twilio; very reliable |
+| **Brevo (ex-Sendinblue)** | 300 emails/day | REST API or SMTP relay | Generous free tier |
+| **Resend** | 100 emails/day, 3,000/month | REST API | Modern, developer-friendly, simple API |
+| **Amazon SES** | 62,000 emails/month (from EC2) | REST API or SMTP | Cheapest at scale; more setup |
+
+These are purpose-built for automated emails and won't flag you as spam the way Gmail sometimes does. You can use them two ways:
+
+1. **SMTP relay** — drop in their SMTP host/port into your existing `notifier.py`. No code changes needed beyond config values.
+2. **REST API** — call their HTTP API with `requests`. Slightly different code but often simpler than SMTP.
+
+### Example: Using a REST API instead of SMTP
+
+If you chose Resend or SendGrid, your `notifier.py` could look like this instead:
+
+```python
+import requests
+
+def send_email(subject: str, body: str, recipient: str, config: dict) -> None:
+    """Send email via a transactional email API."""
+    response = requests.post(
+        config["email_api_url"],
+        headers={"Authorization": f"Bearer {config['email_api_key']}"},
+        json={
+            "from": config["email_from"],
+            "to": recipient,
+            "subject": subject,
+            "text": body,
+        },
+    )
+    response.raise_for_status()
+```
+
+### Which should you pick?
+
+- **For learning:** Gmail + App Password or Outlook. You'll learn how SMTP works, which is foundational knowledge.
+- **For reliability:** Resend or SendGrid with their SMTP relay. Keep your existing `smtplib` code, just change config values, and emails are far less likely to land in spam.
+- **For simplicity:** Resend has the cleanest API if you want to try the REST approach — about 5 lines of code with `requests`.
+
+---
+
+## TDD
+
+### Running Tests
+
+#### From the terminal
+
+The simplest way — run from your project root with the venv active:
+
+```bash
+# Run all tests
+pytest
+
+# Run with verbose output (shows each test name)
+pytest -v
+
+# Run a single test file
+pytest tests/test_checker.py
+
+# Run a single test function
+pytest tests/test_checker.py::test_both_none
+
+# Run with coverage report
+pytest --cov=src
+
+# Stop on first failure (useful while developing)
+pytest -x
+```
+
+#### From VS Code (most seamless)
+
+VS Code has built-in test integration that gives you clickable green/red indicators right in the editor:
+
+1. Open the Command Palette → `Python: Configure Tests`
+2. Select **pytest**
+3. Select **tests** as the test directory
+
+This creates a `.vscode/settings.json` with:
+
+```json
+{
+    "python.testing.pytestEnabled": true,
+    "python.testing.pytestArgs": ["tests"]
+}
+```
+
+Once configured:
+
+- A **beaker icon** (flask) appears in the sidebar — click it to see all discovered tests
+- **Green play buttons** appear next to each test function in the editor — click to run one test
+- **Green checkmarks / red X marks** show pass/fail inline
+- `Ctrl+; A` runs all tests
+- `Ctrl+; F` runs just the tests in the current file
+- `Ctrl+; L` re-runs the last test
+
+#### Recommended setup
+
+Since you're already working in VS Code, do both:
+
+1. Configure VS Code testing (one-time setup, then it's always there)
+2. Use `pytest -v` in the terminal when you want the full output or coverage report
+
+> **Tip:** Make sure your virtual environment is selected as the Python interpreter in VS Code (`Ctrl+Shift+P` → `Python: Select Interpreter` → choose `.venv`). Otherwise VS Code won't find pytest or your `src` modules.
 
 ---
 
